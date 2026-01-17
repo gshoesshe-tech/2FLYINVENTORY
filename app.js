@@ -2,7 +2,7 @@
    - Supabase Auth (email+password)
    - Orders board + View button -> Order Details page
    - New Order (4 types) + Discount/Adjustment for all
-   - Staff can edit discount/status ONLY for orders they created
+   - Staff can edit discount/status/shipping costs ONLY for orders they created
    - Owner/Admin sees Dashboard + Growth Stats + Products/Inventory/Expenses
 */
 (function(){
@@ -297,7 +297,7 @@
 
     const rows = (data||[]).map(o => {
       const canEdit = (role === 'owner' || role === 'admin' || o.created_by_id === session.user.id);
-      const isNegative = Number(o.discount_amount) < 0; // Negative means surcharge/markup
+      const isNegative = Number(o.discount_amount) < 0; 
       return `
         <tr data-oid="${escapeHtml(o.id)}">
           <td>
@@ -368,7 +368,8 @@
         const disc = Number(document.querySelector(`.discInp[data-oid="${CSS.escape(oid)}"]`)?.value || 0);
         const reason = (document.querySelector(`.discReason[data-oid="${CSS.escape(oid)}"]`)?.value || '').trim();
         const { error } = await supabase.rpc('staff_update_order', {
-          p_order_id: oid, p_status: status, p_discount_amount: disc, p_discount_reason: reason
+          p_order_id: oid, p_status: status, p_discount_amount: disc, p_discount_reason: reason, 
+          p_shipping_paid: null, p_courier_cost: null
         });
         if(error) toast(error.message, 'error'); else { toast('Saved.'); reroute(); }
       };
@@ -423,6 +424,7 @@
           <div id="regionWrap">
             <div class="label">Region (Online)</div>
             <select id="region" class="input">
+              <option value="">-- Select --</option>
               <option value="luzon">Luzon</option>
               <option value="visayas">Visayas</option>
               <option value="mindanao">Mindanao</option>
@@ -432,14 +434,23 @@
 
         <div class="grid cols-2" style="margin-top:10px">
           <div id="shipWrap">
-            <div class="label">Shipping Paid (₱)</div>
+            <div class="label">Shipping Paid (by Customer)</div>
             <input id="shippingPaid" class="input" type="number" value="0" />
           </div>
+          <div id="courierWrap">
+            <div class="label">Our Courier Cost (Actual)</div>
+            <input id="courierCost" class="input" type="number" value="0" placeholder="e.g. 54" />
+            <div class="muted small">Auto-suggests standard rate, but you can edit.</div>
+          </div>
+        </div>
+        
+        <div class="grid cols-2" style="margin-top:10px">
           <div>
             <div class="label">Discount / Adjustment (₱)</div>
             <input id="discount" class="input" type="number" value="0" />
             <div class="muted small">Positive = Discount. Negative = Retail Markup / Fee.</div>
           </div>
+          <div><div class="label">Adjustment Reason</div><input id="discountReason" class="input" placeholder="required if adj != 0" /></div>
         </div>
         
         <!-- Retail Helper Tool -->
@@ -455,7 +466,6 @@
           <div><div class="label">Customer Name</div><input id="customerName" class="input" /></div>
           <div><div class="label">FB Link</div><input id="fbLink" class="input" /></div>
           <div><div class="label">Phone</div><input id="phone" class="input" /></div>
-          <div><div class="label">Adjustment Reason</div><input id="discountReason" class="input" placeholder="required if adj != 0" /></div>
         </div>
         <div style="margin-top:10px"><div class="label">Notes</div><textarea id="notes" class="input"></textarea></div>
 
@@ -498,6 +508,7 @@
     if(draft.orderType) document.getElementById('orderType').value = draft.orderType;
     if(draft.region) document.getElementById('region').value = draft.region;
     if(draft.shippingPaid) document.getElementById('shippingPaid').value = draft.shippingPaid;
+    if(draft.courierCost) document.getElementById('courierCost').value = draft.courierCost; // New
     if(draft.discount) document.getElementById('discount').value = draft.discount;
     if(draft.customerName) document.getElementById('customerName').value = draft.customerName;
     if(draft.fbLink) document.getElementById('fbLink').value = draft.fbLink;
@@ -518,6 +529,7 @@
         orderType: document.getElementById('orderType').value,
         region: document.getElementById('region').value,
         shippingPaid: document.getElementById('shippingPaid').value,
+        courierCost: document.getElementById('courierCost').value,
         discount: document.getElementById('discount').value,
         customerName: document.getElementById('customerName').value,
         fbLink: document.getElementById('fbLink').value,
@@ -530,7 +542,7 @@
     }
     
     // Auto-save listeners
-    ['orderType','region','shippingPaid','discount','customerName','fbLink','phone','discountReason','notes'].forEach(id=>{
+    ['orderType','region','shippingPaid','courierCost','discount','customerName','fbLink','phone','discountReason','notes'].forEach(id=>{
       const el = document.getElementById(id);
       el.addEventListener('change', saveForm);
       el.addEventListener('input', saveForm);
@@ -581,12 +593,10 @@
       document.getElementById('bulkPaste').value = '';
     };
 
-    // Retail Markup Helper
     document.getElementById('btnRetailCalc').onclick = () => {
       let subtotal = 0;
       for(const obj of itemsMap.values()) subtotal += (obj.product.sell_price || 0) * obj.qty;
       const markup = subtotal * 0.40; // 40% markup
-      // Set negative discount (markup)
       document.getElementById('discount').value = -Math.round(markup);
       document.getElementById('discountReason').value = "Retail Price (40% Markup)";
       toast(`Applied 40% markup: +${fmtPeso(markup)} (Total: ${fmtPeso(subtotal + markup)})`);
@@ -594,35 +604,59 @@
     };
 
     const orderType = document.getElementById('orderType');
+    const region = document.getElementById('region');
+    
+    // Auto-suggest logic
+    region.onchange = () => {
+      const r = region.value;
+      let cost = 0;
+      if(r === 'luzon') cost = 54;
+      else if(r === 'visayas') cost = 79;
+      else if(r === 'mindanao') cost = 79;
+      
+      // Only auto-fill if user hasn't typed a custom value yet (or if value is 0)
+      const current = document.getElementById('courierCost').value;
+      if(cost > 0 && (current == 0 || current == '')) {
+         document.getElementById('courierCost').value = cost;
+      }
+      saveForm();
+    };
+
     function toggleShipping(){
       const isOnline = (orderType.value === 'online');
       document.getElementById('regionWrap').style.display = isOnline ? '' : 'none';
       document.getElementById('shipWrap').style.display = isOnline ? '' : 'none';
+      document.getElementById('courierWrap').style.display = isOnline ? '' : 'none';
     }
     orderType.onchange = () => { toggleShipping(); saveForm(); };
     toggleShipping();
 
     document.getElementById('btnSubmit').onclick = async () => {
       const t = orderType.value;
-      const region = document.getElementById('region').value;
-      const shippingPaid = Number(document.getElementById('shippingPaid').value || 0);
-      const discount = Number(document.getElementById('discount').value || 0);
-      const discountReason = (document.getElementById('discountReason').value || '').trim();
-      const customerName = (document.getElementById('customerName').value || '').trim();
-      const fbLink = (document.getElementById('fbLink').value || '').trim();
-      const phone = (document.getElementById('phone').value || '').trim();
-      const notes = (document.getElementById('notes').value || '').trim();
+      const r = document.getElementById('region').value;
+      const sp = Number(document.getElementById('shippingPaid').value || 0);
+      const cc = Number(document.getElementById('courierCost').value || 0);
+      const d = Number(document.getElementById('discount').value || 0);
+      const dr = (document.getElementById('discountReason').value || '').trim();
+      const cn = (document.getElementById('customerName').value || '').trim();
+      const fb = (document.getElementById('fbLink').value || '').trim();
+      const ph = (document.getElementById('phone').value || '').trim();
+      const nt = (document.getElementById('notes').value || '').trim();
 
-      if(!customerName){ toast('Customer name is required.', 'error'); return; }
-      if(t === 'walkin' && !phone){ toast('Phone number required for Walk-in.', 'error'); return; }
-      if(discount !== 0 && !discountReason){ toast('Reason required for adjustment.', 'error'); return; }
+      if(!cn){ toast('Customer name is required.', 'error'); return; }
+      if(t === 'walkin' && !ph){ toast('Phone number required for Walk-in.', 'error'); return; }
+      if(d !== 0 && !dr){ toast('Reason required for adjustment.', 'error'); return; }
       if(itemsMap.size === 0){ toast('No items in order.', 'error'); return; }
 
       const items = Array.from(itemsMap.values()).map(x=>({ sku: x.sku, qty: x.qty }));
+      
+      // Use new parameter p_courier_cost
       const payload = {
-        p_order_type: t, p_region: t==='online'?region:null, p_shipping_paid: t==='online'?shippingPaid:0,
-        p_discount_amount: discount, p_discount_reason: discountReason,
-        p_customer_name: customerName, p_profile_link: fbLink, p_phone_number: phone, p_notes: notes,
+        p_order_type: t, p_region: t==='online'?r:null, 
+        p_shipping_paid: t==='online'?sp:0,
+        p_courier_cost: t==='online'?cc:0,
+        p_discount_amount: d, p_discount_reason: dr,
+        p_customer_name: cn, p_profile_link: fb, p_phone_number: ph, p_notes: nt,
         p_items: items
       };
       
@@ -677,7 +711,11 @@
     const disc = Number(order.discount_amount||0);
     const finalTotal = sub - disc; // If disc is negative (markup), total increases
     const profit = finalTotal - cogs;
-    const shipProfit = (order.order_type==='online') ? (order.shipping_paid - order.courier_cost) : 0;
+    
+    // Calc shipping profit visually based on current DB values
+    const sPaid = Number(order.shipping_paid||0);
+    const cCost = Number(order.courier_cost||0);
+    const shipProfit = (order.order_type==='online') ? (sPaid - cCost) : 0;
     
     render(`
       <div class="card">
@@ -690,17 +728,18 @@
         <div class="grid cols-3">
           <div class="kpi">
             <div class="num">${fmtPeso(finalTotal)}</div>
-            <div class="cap">Net Sales</div>
+            <div class="cap">Net Sales (Items)</div>
             <div class="muted small">Sub ${fmtPeso(sub)} • ${disc>0?'Disc':'Markup'} ${fmtPeso(Math.abs(disc))}</div>
           </div>
           <div class="kpi">
             <div class="num" style="color:${shipProfit<0?'var(--danger)':'inherit'}">${fmtPeso(shipProfit)}</div>
             <div class="cap">Shipping Profit</div>
+            <div class="muted small">${fmtPeso(sPaid)} - ${fmtPeso(cCost)} (Cost)</div>
           </div>
           <div class="kpi">
             <div class="num">${fmtPeso(profit + shipProfit)}</div>
             <div class="cap">Total Gross Profit</div>
-            <div class="muted small">COGS ${fmtPeso(cogs)}</div>
+            <div class="muted small">Items Profit + Ship Profit</div>
           </div>
         </div>
 
@@ -711,8 +750,26 @@
             <div style="font-weight:900">${escapeHtml(order.customer_name)}</div>
             <div class="muted small">Phone: ${escapeHtml(order.phone_number||'—')}</div>
             <div class="muted small">Notes: ${escapeHtml(order.notes||'—')}</div>
+            <div class="hr"></div>
+            
+            <div class="h2">Shipping Financials</div>
+            <div class="notice" style="margin-bottom:10px">
+              <div class="small"><b>Correct your profit:</b> If you paid a different courier fee, edit "Actual Courier Cost" and Save.</div>
+            </div>
+            <div class="grid cols-2">
+              <div>
+                <div class="label">Customer Paid (₱)</div>
+                <input id="shipPaid" class="input" type="number" value="${sPaid}" ${canEdit?'':'disabled'} />
+              </div>
+              <div>
+                <div class="label">Actual Courier Cost (₱)</div>
+                <input id="courierCost" class="input" type="number" value="${cCost}" ${canEdit?'':'disabled'} />
+              </div>
+            </div>
           </div>
+
           <div>
+            <div class="h2">Order Status & Adjustment</div>
             <div class="label">Status</div>
             <select id="st" class="input" ${canEdit?'':'disabled'}>
               ${['pending','paid','packed','shipped','completed','cancelled'].map(s => `<option value="${s}" ${order.status===s?'selected':''}>${s}</option>`).join('')}
@@ -721,7 +778,10 @@
             <input id="disc" class="input" type="number" value="${disc}" ${canEdit?'':'disabled'} />
             <div class="label" style="margin-top:8px">Reason</div>
             <input id="reas" class="input" value="${escapeHtml(order.discount_reason||'')}" ${canEdit?'':'disabled'} />
-            <div class="row" style="margin-top:10px"><button class="btn primary" id="btnSave" ${canEdit?'':'disabled'}>Save</button></div>
+            
+            <div class="row" style="margin-top:20px">
+              <button class="btn primary" id="btnSave" ${canEdit?'':'disabled'} style="width:100%">Save Changes</button>
+            </div>
           </div>
         </div>
 
@@ -736,8 +796,20 @@
       const st = document.getElementById('st').value;
       const d = Number(document.getElementById('disc').value);
       const r = document.getElementById('reas').value;
-      if(d !== 0 && !r){ toast('Reason required.', 'error'); return; }
-      const { error } = await supabase.rpc('staff_update_order', { p_order_id: order.id, p_status: st, p_discount_amount: d, p_discount_reason: r });
+      const sp = Number(document.getElementById('shipPaid').value);
+      const cc = Number(document.getElementById('courierCost').value);
+
+      if(d !== 0 && !r){ toast('Reason required for discount/adjustment.', 'error'); return; }
+
+      // We use the updated RPC that accepts shipping info
+      const { error } = await supabase.rpc('staff_update_order', { 
+        p_order_id: order.id, 
+        p_status: st, 
+        p_discount_amount: d, 
+        p_discount_reason: r,
+        p_shipping_paid: sp,
+        p_courier_cost: cc
+      });
       if(error) toast(error.message, 'error'); else { toast('Saved.'); reroute(); }
     });
   }
@@ -776,7 +848,7 @@
   }
 
   // -----------------
-  // Owner Dashboard (Enhanced for Growth)
+  // Owner Dashboard
   // -----------------
   async function renderDashboard(){
     if(!requireAuth() || !requireOwner()) return;
@@ -835,8 +907,6 @@
         ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Qty</th></tr></thead><tbody>${low.map(x=>`<tr><td><b>${x.sku}</b></td><td><span class="pill bad">${x.qty_on_hand}</span></td></tr>`).join('')}</tbody></table></div>`
         : `<div class="pill good">All good</div>`;
 
-      // Top Products (Manually aggregate last 1000 items to avoid heavy SQL for now)
-      // This is a "good enough" approximation for small biz without creating new Views
       const { data: items } = await supabase.from('order_items').select('sku, qty').order('created_at', {ascending:false}).limit(1000);
       const counts = {};
       (items||[]).forEach(i => counts[i.sku] = (counts[i.sku]||0) + i.qty);
