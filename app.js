@@ -467,7 +467,7 @@
           <div><div class="label">FB Link</div><input id="fbLink" class="input" /></div>
           <div><div class="label">Phone</div><input id="phone" class="input" /></div>
         </div>
-        <div style="margin-top:10px"><div class="label">Notes</div><textarea id="notes" class="input"></textarea></div>
+        <div style="margin-top:10px"><div class="label">Delivery Address / Notes</div><textarea id="notes" class="input" placeholder="Full Address Here..."></textarea></div>
 
         <div class="hr"></div>
 
@@ -508,7 +508,7 @@
     if(draft.orderType) document.getElementById('orderType').value = draft.orderType;
     if(draft.region) document.getElementById('region').value = draft.region;
     if(draft.shippingPaid) document.getElementById('shippingPaid').value = draft.shippingPaid;
-    if(draft.courierCost) document.getElementById('courierCost').value = draft.courierCost; // New
+    if(draft.courierCost) document.getElementById('courierCost').value = draft.courierCost; 
     if(draft.discount) document.getElementById('discount').value = draft.discount;
     if(draft.customerName) document.getElementById('customerName').value = draft.customerName;
     if(draft.fbLink) document.getElementById('fbLink').value = draft.fbLink;
@@ -614,7 +614,6 @@
       else if(r === 'visayas') cost = 79;
       else if(r === 'mindanao') cost = 79;
       
-      // Only auto-fill if user hasn't typed a custom value yet (or if value is 0)
       const current = document.getElementById('courierCost').value;
       if(cost > 0 && (current == 0 || current == '')) {
          document.getElementById('courierCost').value = cost;
@@ -650,7 +649,6 @@
 
       const items = Array.from(itemsMap.values()).map(x=>({ sku: x.sku, qty: x.qty }));
       
-      // Use new parameter p_courier_cost
       const payload = {
         p_order_type: t, p_region: t==='online'?r:null, 
         p_shipping_paid: t==='online'?sp:0,
@@ -671,7 +669,7 @@
   }
 
   // -----------------
-  // Order Details
+  // Order Details (UPDATED WITH COPY & PRINT)
   // -----------------
   async function renderOrderDetails(){
     if(!requireAuth()) return;
@@ -693,7 +691,6 @@
 
     const { data: items } = await supabase.from('order_items').select('*').eq('order_id', order.id).order('created_at');
     
-    // Fetch product names
     const skus = [...new Set((items||[]).map(x=>x.sku))];
     let nameMap = {};
     if(skus.length){
@@ -709,19 +706,22 @@
     const sub = (items||[]).reduce((a,it) => a + (it.sell_price_at_time*it.qty), 0);
     const cogs = (items||[]).reduce((a,it) => a + (it.unit_cost_at_time*it.qty), 0);
     const disc = Number(order.discount_amount||0);
-    const finalTotal = sub - disc; // If disc is negative (markup), total increases
+    const finalTotal = sub - disc; 
     const profit = finalTotal - cogs;
     
-    // Calc shipping profit visually based on current DB values
     const sPaid = Number(order.shipping_paid||0);
     const cCost = Number(order.courier_cost||0);
     const shipProfit = (order.order_type==='online') ? (sPaid - cCost) : 0;
     
     render(`
       <div class="card">
-        <div class="row">
+        <div class="row" style="margin-bottom:12px">
           <div class="grow"><div class="h1">${escapeHtml(order.order_code)}</div><div class="muted small">${new Date(order.created_at).toLocaleString()}</div></div>
-          <a class="btn" href="#/orders">Back</a>
+          <div class="row">
+            <button class="btn" id="btnCopy">Copy</button>
+            <button class="btn" id="btnPrint">Print Waybill</button>
+            <a class="btn" href="#/orders">Back</a>
+          </div>
         </div>
         <div class="hr"></div>
 
@@ -749,12 +749,12 @@
             <div class="h2">Customer</div>
             <div style="font-weight:900">${escapeHtml(order.customer_name)}</div>
             <div class="muted small">Phone: ${escapeHtml(order.phone_number||'—')}</div>
-            <div class="muted small">Notes: ${escapeHtml(order.notes||'—')}</div>
+            <div class="muted small">Address/Notes: ${escapeHtml(order.notes||'—')}</div>
             <div class="hr"></div>
             
             <div class="h2">Shipping Financials</div>
             <div class="notice" style="margin-bottom:10px">
-              <div class="small"><b>Correct your profit:</b> If you paid a different courier fee, edit "Actual Courier Cost" and Save.</div>
+              <div class="small"><b>Profit Check:</b> Edit "Actual Courier Cost" if actual differs from standard.</div>
             </div>
             <div class="grid cols-2">
               <div>
@@ -792,6 +792,62 @@
       </div>
     `);
 
+    // Copy to Clipboard
+    document.getElementById('btnCopy').onclick = () => {
+      const text = `
+ORDER: ${order.order_code}
+NAME: ${order.customer_name}
+PHONE: ${order.phone_number || 'N/A'}
+REGION: ${order.region || 'N/A'}
+FB: ${order.profile_link || 'N/A'}
+----------------
+${(items||[]).map(i => `${i.qty}x ${nameMap[i.sku] || i.sku}`).join('\n')}
+----------------
+TOTAL: ${fmtPeso(finalTotal)}
+ADDRESS/NOTES: ${order.notes || ''}
+      `.trim();
+      navigator.clipboard.writeText(text).then(()=>toast('Copied to clipboard')).catch(()=>toast('Failed to copy','error'));
+    };
+
+    // Print Thermal Waybill
+    document.getElementById('btnPrint').onclick = () => {
+      const w = window.open('', '_blank', 'width=400,height=600');
+      w.document.write(`
+        <html>
+        <head>
+          <title>Print Order</title>
+          <style>
+            body{ font-family: sans-serif; padding:10px; font-size:12px; max-width: 300px; margin:0 auto; }
+            .h{ font-weight:bold; font-size:16px; margin-bottom:5px; }
+            .row{ display:flex; justify-content:space-between; margin-bottom:2px; }
+            .hr{ border-top:1px dashed #000; margin: 10px 0; }
+            .center{ text-align:center; }
+            .big{ font-size:14px; font-weight:bold; }
+          </style>
+        </head>
+        <body>
+          <div class="center h">2FLY WHOLESALE</div>
+          <div class="center">${order.order_code}</div>
+          <div class="hr"></div>
+          <div class="big">${order.customer_name}</div>
+          <div class="big">${order.phone_number || ''}</div>
+          <div>${order.region ? order.region.toUpperCase() : ''}</div>
+          <div style="font-size:10px; margin-top:4px">${order.profile_link || ''}</div>
+          <div class="hr"></div>
+          ${(items||[]).map(i => `<div class="row"><span>${i.qty}x ${nameMap[i.sku] || i.sku}</span><span>${fmtPeso(i.sell_price_at_time * i.qty)}</span></div>`).join('')}
+          <div class="hr"></div>
+          <div class="row big"><span>TOTAL</span><span>${fmtPeso(finalTotal)}</span></div>
+          ${order.shipping_paid > 0 ? `<div class="row" style="font-size:10px"><span>(Ship Paid: ${fmtPeso(order.shipping_paid)})</span></div>` : ''}
+          <div class="hr"></div>
+          <div style="font-weight:bold">DELIVERY ADDRESS / NOTES:</div>
+          <div style="white-space:pre-wrap;">${order.notes || 'None'}</div>
+          <script>window.print();</script>
+        </body>
+        </html>
+      `);
+      w.document.close();
+    };
+
     document.getElementById('btnSave')?.addEventListener('click', async ()=>{
       const st = document.getElementById('st').value;
       const d = Number(document.getElementById('disc').value);
@@ -801,7 +857,6 @@
 
       if(d !== 0 && !r){ toast('Reason required for discount/adjustment.', 'error'); return; }
 
-      // We use the updated RPC that accepts shipping info
       const { error } = await supabase.rpc('staff_update_order', { 
         p_order_id: order.id, 
         p_status: st, 
@@ -877,7 +932,6 @@
       </div>
     `);
 
-    // Load extra widgets immediately
     loadGrowthWidgets();
 
     document.getElementById('btnRun').onclick = async ()=>{
@@ -901,7 +955,6 @@
     };
 
     async function loadGrowthWidgets(){
-      // Low Stock
       const { data: low } = await supabase.from('inventory_view').select('sku, qty_on_hand').lt('qty_on_hand', 5).order('qty_on_hand');
       document.getElementById('lowStock').innerHTML = (low||[]).length 
         ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Qty</th></tr></thead><tbody>${low.map(x=>`<tr><td><b>${x.sku}</b></td><td><span class="pill bad">${x.qty_on_hand}</span></td></tr>`).join('')}</tbody></table></div>`
@@ -918,9 +971,6 @@
     }
   }
 
-  // -----------------
-  // Simple Table Helpers (Products, etc)
-  // -----------------
   async function renderProducts(){
     if(!requireAuth() || !requireOwner()) return;
     const { data } = await supabase.from('products').select('*').order('sku');
@@ -997,7 +1047,6 @@
     });
   }
 
-  // Reused simplistic table renderer for Expenses/Receivables/Payables
   async function renderSimple(title, table, cols){
     if(!requireAuth() || !requireOwner()) return;
     const { data } = await supabase.from(table).select('*').order('created_at',{ascending:false}).limit(50);
