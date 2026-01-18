@@ -1,3 +1,4 @@
+
 /* 2FLY Internal Wholesale System (Static)
    - Supabase Auth (email+password)
    - Orders board + View button -> Order Details page
@@ -46,10 +47,13 @@
   }
 
   function getConfig(){
+    // Supports both config styles:
+    //   A) window.APP_CONFIG = { SUPABASE_URL, SUPABASE_ANON_KEY }
+    //   B) window.__SUPABASE_URL__ / window.__SUPABASE_ANON_KEY__
     const cfg = (window.APP_CONFIG || {});
-    const url = cfg.SUPABASE_URL;
-    const key = cfg.SUPABASE_ANON_KEY;
-    if(!url || !key || url.includes('PUT_SUPABASE') || key.includes('PUT_SUPABASE')){
+    const url = cfg.SUPABASE_URL || window.__SUPABASE_URL__;
+    const key = cfg.SUPABASE_ANON_KEY || window.__SUPABASE_ANON_KEY__;
+    if(!url || !key || String(url).includes('PUT_SUPABASE') || String(key).includes('PUT_SUPABASE')){
       return null;
     }
     return { url, key };
@@ -905,29 +909,42 @@ ADDRESS/NOTES: ${order.notes || ''}
   // -----------------
   // Owner Dashboard
   // -----------------
+
   async function renderDashboard(){
     if(!requireAuth() || !requireOwner()) return;
-    const today = new Date().toISOString().slice(0,10);
+
+    const today = new Date();
+    const isoToday = today.toISOString().slice(0,10);
+    const monthStart = new Date(today.getFullYear(), today.getMonth(), 1).toISOString().slice(0,10);
+
     render(`
       <div class="card">
         <div class="h1">Owner Dashboard</div>
-        <div class="grid cols-2">
-          <div><div class="label">Start</div><input id="d1" class="input" type="date" value="${today.slice(0,8)}01" /></div>
-          <div><div class="label">End</div><input id="d2" class="input" type="date" value="${today}" /></div>
+        <div class="muted small">Tip: Set date range to the current month to review monthly performance.</div>
+        <div class="grid cols-2" style="margin-top:10px">
+          <div><div class="label">Start</div><input id="d1" class="input" type="date" value="${monthStart}" /></div>
+          <div><div class="label">End</div><input id="d2" class="input" type="date" value="${isoToday}" /></div>
         </div>
-        <div class="row" style="margin-top:10px"><button class="btn primary" id="btnRun">Run Report</button></div>
+        <div class="row" style="margin-top:10px">
+          <button class="btn primary" id="btnRun">Run Report</button>
+          <span class="muted small" id="runHint"></span>
+        </div>
         <div class="hr"></div>
         <div id="out"></div>
       </div>
-      
+
       <div class="grid cols-2" style="margin-top:18px">
         <div class="card">
-          <div class="h2">Top Products (Last 30 days)</div>
+          <div class="h2">Top SKUs (Last 30 days)</div>
           <div id="topProds" class="muted small">Loading...</div>
         </div>
         <div class="card">
-          <div class="h2">Low Stock Alert (< 5)</div>
+          <div class="h2">Stock Alerts</div>
+          <div class="muted small">Low Stock (&lt; 5) + Sold Out</div>
+          <div class="hr"></div>
           <div id="lowStock" class="muted small">Loading...</div>
+          <div class="hr"></div>
+          <div id="soldOut" class="muted small">Loading...</div>
         </div>
       </div>
     `);
@@ -937,37 +954,161 @@ ADDRESS/NOTES: ${order.notes || ''}
     document.getElementById('btnRun').onclick = async ()=>{
       const d1 = document.getElementById('d1').value;
       const d2 = document.getElementById('d2').value;
-      const { data: s, error } = await supabase.rpc('owner_dashboard_summary', { p_start: d1, p_end: d2 });
-      if(error){ toast(error.message,'error'); return; }
-      const x = s?.[0] || {};
-      const { data: cat } = await supabase.rpc('owner_profit_by_category', { p_start: d1, p_end: d2 });
-      
+      document.getElementById('runHint').textContent = 'Running...';
+
+      // Summary cards (old + new split)
+      const [{ data: split, error: eSplit }, { data: expSum, error: eBase }] = await Promise.all([
+        supabase.rpc('owner_profit_summary_split', { p_start: d1, p_end: d2 }),
+        supabase.rpc('owner_dashboard_summary', { p_start: d1, p_end: d2 }),
+      ]);
+      if(eSplit){ toast(eSplit.message,'error'); document.getElementById('runHint').textContent=''; return; }
+      if(eBase){ toast(eBase.message,'error'); document.getElementById('runHint').textContent=''; return; }
+
+      const sp = split?.[0] || { product_profit:0, shipping_profit:0, total_profit:0 };
+      const base = expSum?.[0] || { expenses_total:0 };
+
+      // Per order profit table
+      const { data: ord, error: eOrd } = await supabase.rpc('owner_orders_profit_report', { p_start: d1, p_end: d2 });
+      if(eOrd){ toast(eOrd.message,'error'); document.getElementById('runHint').textContent=''; return; }
+
+      // Profit by category (product profit only)
+      const { data: cat, error: eCat } = await supabase.rpc('owner_profit_by_category', { p_start: d1, p_end: d2 });
+      if(eCat){ toast(eCat.message,'error'); document.getElementById('runHint').textContent=''; return; }
+
+      // Top SKUs in selected range (qty + product profit)
+      const { data: skuRpt } = await supabase.rpc('owner_sku_sales_report', { p_start: d1, p_end: d2 });
+
+      const netAfterExpenses = (Number(sp.total_profit||0) - Number(base.expenses_total||0));
+
+      const topSkuRows = (skuRpt||[]).slice(0,10).map(r=>`
+        <tr>
+          <td class="mono"><b>${escapeHtml(r.sku)}</b></td>
+          <td>${escapeHtml(r.name||'')}</td>
+          <td>${r.qty_sold}</td>
+          <td>${fmtPeso(r.revenue)}</td>
+          <td>${fmtPeso(r.profit)}</td>
+        </tr>
+      `).join('');
+
+      const orderRows = (ord||[]).map(o=>`
+        <tr>
+          <td>${new Date(o.created_at).toLocaleDateString()}</td>
+          <td class="mono"><a href="#/order?id=${encodeURIComponent(o.order_code)}">${escapeHtml(o.order_code)}</a></td>
+          <td>${escapeHtml(o.customer_name||'')}</td>
+          <td><span class="pill ${String(o.status)==='paid'||String(o.status)==='packed'||String(o.status)==='shipped'||String(o.status)==='completed'?'good':'warn'}">${escapeHtml(String(o.status||'').toUpperCase())}</span></td>
+          <td>${fmtPeso(o.product_profit)}</td>
+          <td style="color:${Number(o.shipping_profit)<0?'var(--danger)':'inherit'}">${fmtPeso(o.shipping_profit)}</td>
+          <td><b>${fmtPeso(o.total_profit)}</b></td>
+        </tr>
+      `).join('');
+
       document.getElementById('out').innerHTML = `
         <div class="grid cols-3">
-          <div class="kpi"><div class="num">${fmtPeso(x.net_after_expenses)}</div><div class="cap">Net Profit (Clean)</div></div>
-          <div class="kpi"><div class="num">${fmtPeso(x.items_profit)}</div><div class="cap">Items Profit</div></div>
-          <div class="kpi"><div class="num">${fmtPeso(x.expenses_total)}</div><div class="cap">Expenses</div></div>
+          <div class="kpi"><div class="num">${fmtPeso(sp.product_profit)}</div><div class="cap">Product Profit</div><div class="muted small">(Items margin − discounts)</div></div>
+          <div class="kpi"><div class="num" style="color:${Number(sp.shipping_profit)<0?'var(--danger)':'inherit'}">${fmtPeso(sp.shipping_profit)}</div><div class="cap">Shipping Profit</div><div class="muted small">Shipping paid − courier cost</div></div>
+          <div class="kpi"><div class="num">${fmtPeso(sp.total_profit)}</div><div class="cap">Total Profit</div><div class="muted small">Product + Shipping</div></div>
         </div>
+
         <div class="grid cols-2" style="margin-top:12px">
-           <div class="tablewrap"><table class="small"><thead><tr><th>Category</th><th>Profit</th></tr></thead><tbody>${(cat||[]).map(c=>`<tr><td>${c.category}</td><td>${fmtPeso(c.profit)}</td></tr>`).join('')}</tbody></table></div>
+          <div class="kpi"><div class="num">${fmtPeso(base.expenses_total)}</div><div class="cap">Expenses</div></div>
+          <div class="kpi"><div class="num">${fmtPeso(netAfterExpenses)}</div><div class="cap">Net After Expenses</div><div class="muted small">Total profit − expenses</div></div>
+        </div>
+
+        <div class="grid cols-2" style="margin-top:12px">
+          <div class="card" style="margin:0">
+            <div class="h2">Profit by Category (Products)</div>
+            <div class="tablewrap" style="margin-top:10px">
+              <table class="small">
+                <thead><tr><th>Category</th><th>Profit</th></tr></thead>
+                <tbody>${(cat||[]).map(c=>`<tr><td>${escapeHtml(c.category)}</td><td>${fmtPeso(c.profit)}</td></tr>`).join('')}</tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="card" style="margin:0">
+            <div class="h2">Top SKUs (Selected Range)</div>
+            <div class="muted small">Shows qty sold + revenue + product profit</div>
+            <div class="tablewrap" style="margin-top:10px">
+              <table class="small">
+                <thead><tr><th>SKU</th><th>Name</th><th>Qty</th><th>Revenue</th><th>Profit</th></tr></thead>
+                <tbody>${topSkuRows || `<tr><td colspan="5" class="muted">No data in range</td></tr>`}</tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:12px">
+          <div class="h2">Profit per Order</div>
+          <div class="muted small">Product profit and shipping profit are separated.</div>
+          <div class="tablewrap" style="margin-top:10px">
+            <table class="small">
+              <thead>
+                <tr>
+                  <th>Date</th><th>Order</th><th>Customer</th><th>Status</th>
+                  <th>Product Profit</th><th>Shipping Profit</th><th>Total</th>
+                </tr>
+              </thead>
+              <tbody>
+                ${orderRows || `<tr><td colspan="7" class="muted">No orders in range</td></tr>`}
+              </tbody>
+            </table>
+          </div>
         </div>
       `;
+
+      document.getElementById('runHint').textContent = '';
     };
 
     async function loadGrowthWidgets(){
-      const { data: low } = await supabase.from('inventory_view').select('sku, qty_on_hand').lt('qty_on_hand', 5).order('qty_on_hand');
-      document.getElementById('lowStock').innerHTML = (low||[]).length 
-        ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Qty</th></tr></thead><tbody>${low.map(x=>`<tr><td><b>${x.sku}</b></td><td><span class="pill bad">${x.qty_on_hand}</span></td></tr>`).join('')}</tbody></table></div>`
-        : `<div class="pill good">All good</div>`;
+      // Low stock (<5)
+      const { data: low } = await supabase
+        .from('inventory_view')
+        .select('sku, qty_on_hand')
+        .lt('qty_on_hand', 5)
+        .order('qty_on_hand');
 
-      const { data: items } = await supabase.from('order_items').select('sku, qty').order('created_at', {ascending:false}).limit(1000);
-      const counts = {};
-      (items||[]).forEach(i => counts[i.sku] = (counts[i.sku]||0) + i.qty);
-      const sorted = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0, 5);
-      
-      document.getElementById('topProds').innerHTML = sorted.length
-        ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Sold (Recent)</th></tr></thead><tbody>${sorted.map(([k,v])=>`<tr><td>${k}</td><td>${v}</td></tr>`).join('')}</tbody></table></div>`
-        : `No recent data`;
+      document.getElementById('lowStock').innerHTML = (low||[]).length
+        ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Qty</th></tr></thead><tbody>${low.map(x=>`<tr><td><b>${escapeHtml(x.sku)}</b></td><td><span class="pill bad">${x.qty_on_hand}</span></td></tr>`).join('')}</tbody></table></div>`
+        : `<div class="pill good">Low stock: none</div>`;
+
+      // Sold out (0)
+      try{
+        const { data: so, error } = await supabase.rpc('owner_sold_out_report');
+        if(error) throw error;
+        document.getElementById('soldOut').innerHTML = (so||[]).length
+          ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Qty</th></tr></thead><tbody>${so.map(x=>`<tr><td><b>${escapeHtml(x.sku)}</b></td><td><span class="pill bad">${x.qty_on_hand}</span></td></tr>`).join('')}</tbody></table></div>`
+          : `<div class="pill good">Sold out: none</div>`;
+      }catch(_e){
+        document.getElementById('soldOut').innerHTML = `<div class="muted small">Sold-out report not set up yet.</div>`;
+      }
+
+      // Top products last 30 days (accurate)
+      try{
+        const end = new Date();
+        const start = new Date(end.getTime() - 30*24*60*60*1000);
+        const d1 = start.toISOString().slice(0,10);
+        const d2 = end.toISOString().slice(0,10);
+
+        const { data: rpt, error } = await supabase.rpc('owner_sku_sales_report', { p_start: d1, p_end: d2 });
+        if(error) throw error;
+        const top = (rpt||[]).slice(0, 8);
+        document.getElementById('topProds').innerHTML = top.length
+          ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Qty</th><th>Profit</th></tr></thead><tbody>${top.map(r=>`<tr><td class="mono"><b>${escapeHtml(r.sku)}</b></td><td>${r.qty_sold}</td><td>${fmtPeso(r.profit)}</td></tr>`).join('')}</tbody></table></div>`
+          : `No sales in last 30 days`;
+      }catch(_e){
+        // Fallback to old quick heuristic if report isn't available
+        const { data: items } = await supabase
+          .from('order_items')
+          .select('sku, qty')
+          .order('created_at', {ascending:false})
+          .limit(1000);
+        const counts = {};
+        (items||[]).forEach(i => counts[i.sku] = (counts[i.sku]||0) + i.qty);
+        const sorted = Object.entries(counts).sort((a,b)=>b[1]-a[1]).slice(0, 8);
+        document.getElementById('topProds').innerHTML = sorted.length
+          ? `<div class="tablewrap"><table><thead><tr><th>SKU</th><th>Sold (Recent)</th></tr></thead><tbody>${sorted.map(([k,v])=>`<tr><td>${escapeHtml(k)}</td><td>${v}</td></tr>`).join('')}</tbody></table></div>`
+          : `No recent data`;
+      }
     }
   }
 
